@@ -119,7 +119,7 @@ It'll be blank. You either have to use `&Person{"John", "Smith"}`, or call `Name
 * Sections (boolean, enumerable, and inverted)
 * Partials
 
-## New Points
+## New features
 
 * Nested visit
 * Template Inheritance

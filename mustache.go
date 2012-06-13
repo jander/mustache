@@ -98,7 +98,6 @@ type variableElement struct {
 func (el *variableElement) Render(writer io.Writer, contextChain []interface{}) {
 	val := lookup(el.name, contextChain)
 	if val.IsValid(){
-		fmt.Println("raw", el.raw)
 		if el.raw{
 			fmt.Fprint(writer, val.Interface())
 		}else{

@@ -191,10 +191,11 @@ func TestPartial(t *testing.T) {
 func TestSectionPartial(t *testing.T) {
 	filename := path.Join(path.Join(os.Getenv("PWD"), "tests"), "test3.mustache")
 	expected := "Mike\nJoe\n"
+	expected2 := "Mike\r\nJoe\r\n" //newline maybe '\r\n"
 	context := map[string]interface{}{"users": []User{{"Mike", 1}, {"Joe", 2}}}
 
 	output := RenderFile(filename, context)
-	if output != expected {
+	if output != expected && output!= expected2{
 		t.Fatalf("testSectionPartial expected %q got %q", expected, output)
 	}
 }

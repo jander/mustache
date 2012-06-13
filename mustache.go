@@ -1,609 +1,683 @@
 package mustache
 
 import (
-    "bytes"
-    "errors"
-    "fmt"
     "io"
-    "io/ioutil"
-    "os"
-    "path"
-    "reflect"
-    "strings"
+	"io/ioutil"
+	"fmt"
+	"html"
+	"reflect"
+	"strings"
+	"bytes"
+	"os"
+	"path"
 )
 
-type textElement struct {
-    text []byte
+/*
+==================================
+mustache element
+==================================
+
+variable element:
+	{{variable}}
+
+raw, now escape html tag:
+	{{{variable}}}
+
+if or for:
+	{{#variable}}{{/variable}}
+
+not:
+	{{^variable}}{{/variable}}
+
+comment element:
+	{{! comment words }}
+
+include element:
+	{{>include_name}}
+
+function element:
+	{{function}}
+	{{#function}}{{/function}}
+
+==================================
+New pionts below
+==================================
+template inheritance:
+	{{<template_name}}
+
+block element:
+	{{*block_name}}
+*/
+
+type element interface {
+	Type() ElementType
+	Render(writer io.Writer, contextChain []interface{})
+	String() string
 }
 
-type varElement struct {
-    name string
-    raw  bool
+type container interface{
+	element
+	addChild(child element)
+	getName() string
+}
+
+type ElementType int
+
+func (t ElementType) Type() ElementType{
+	return t
+}
+
+const (
+	textType       ElementType = iota // Plain text.
+	variableType
+	sectionType
+	templateType
+	blockType
+)
+
+
+type textElement struct {
+	ElementType
+	text []byte
+}
+
+func (el *textElement) Render(writer io.Writer, contextChain []interface{}) {
+	writer.Write(el.text)
+}
+
+func (el *textElement) String() string{
+	return fmt.Sprintf("Text{ %q }", el.text)
+}
+
+type variableElement struct {
+	ElementType
+	name string
+	raw bool
+}
+
+func (el *variableElement) Render(writer io.Writer, contextChain []interface{}) {
+	val := lookup(el.name, contextChain)
+	if val.IsValid(){
+		fmt.Println("raw", el.raw)
+		if el.raw{
+			fmt.Fprint(writer, val.Interface())
+		}else{
+			s := fmt.Sprint(val.Interface())
+			fmt.Fprint(writer, html.EscapeString(s))
+		}
+	}
+}
+
+func (el *variableElement) String() string{
+	return fmt.Sprintf("Variable{ name=%s, raw=%v }", el.name, el.raw)
 }
 
 type sectionElement struct {
-    name      string
-    inverted  bool
-    startline int
-    elems     []interface{}
+	ElementType
+	name string
+	inverted bool
+	elements []element
 }
+
+func (el *sectionElement) String() string{
+	return fmt.Sprintf("Section{ name=%s, inverted=%v, elements=%v }", el.name, el.inverted, el.elements)
+}
+
+func (el *sectionElement) addChild(child element) {
+	el.elements = append(el.elements, child)
+}
+
+func (el *sectionElement) getName() string{
+	return el.name
+}
+
+func (section *sectionElement) Render(writer io.Writer, contextChain []interface{}) {
+	val := lookup(section.name, contextChain)
+
+	var ctxs = []interface{}{}
+	// if the value is nil, check if it's an inverted section
+	isTrue := isTrue(val)
+	if !isTrue && !section.inverted || isTrue && section.inverted {
+		return
+	} else {
+		switch val.Kind() {
+		case reflect.Slice:
+			for i := 0; i < val.Len(); i++ {
+				ctxs = append(ctxs, val.Index(i).Interface())
+			}
+		case reflect.Array:
+			for i := 0; i < val.Len(); i++ {
+				ctxs = append(ctxs, val.Index(i).Interface())
+			}
+		//case reflect.Map, reflect.Struct:
+		default:
+			if val.IsValid(){
+				ctxs = append(ctxs, val.Interface())
+			}else{
+				ctxs = append(ctxs, "")
+			}
+		}
+	}
+
+	chain := make([]interface{}, len(contextChain)+1)
+	copy(chain[1:], contextChain)
+
+	for _, ctx := range ctxs {
+		chain[0] = ctx
+		for _, el := range section.elements {
+			el.Render(writer, chain)
+		}
+	}
+}
+
+
+type blockElement struct{
+	ElementType
+	name string
+	elements []element
+}
+
+func (el *blockElement) String() string{
+	return fmt.Sprintf("block{ name=%s, elements=%v }", el.name, el.elements)
+}
+
+func (el *blockElement) addChild(child element) {
+	el.elements = append(el.elements, child)
+}
+
+func (el *blockElement) getName() string{
+	return el.name
+}
+
+func (el *blockElement) Render(writer io.Writer, contextChain []interface{}) {
+	for _, el := range el.elements {
+		el.Render(writer, contextChain)
+	}
+}
+
 
 type Template struct {
-    data    string
-    otag    string
-    ctag    string
-    p       int
-    curline int
-    dir     string
-    elems   []interface{}
+	ElementType
+	data []byte
+	leftToken string
+	rightToken string
+	pos int
+	line int
+	dir string
+	elements []element
+	blocks map[string]*blockElement
+	ext string
+	parent string
 }
 
-type parseError struct {
-    line    int
-    message string
+func (el *Template) String() string{
+	return fmt.Sprintf("\nTemplate{elements=%v,\n blocks=%v,\n parent=%v}\n", el.elements, el.blocks, el.parent)
 }
 
-func (p parseError) Error() string { return fmt.Sprintf("line %d: %s", p.line, p.message) }
-
-var (
-    esc_quot = []byte("&quot;")
-    esc_apos = []byte("&apos;")
-    esc_amp  = []byte("&amp;")
-    esc_lt   = []byte("&lt;")
-    esc_gt   = []byte("&gt;")
-)
-
-// taken from pkg/template
-func htmlEscape(w io.Writer, s []byte) {
-    var esc []byte
-    last := 0
-    for i, c := range s {
-        switch c {
-        case '"':
-            esc = esc_quot
-        case '\'':
-            esc = esc_apos
-        case '&':
-            esc = esc_amp
-        case '<':
-            esc = esc_lt
-        case '>':
-            esc = esc_gt
-        default:
-            continue
-        }
-        w.Write(s[last:i])
-        w.Write(esc)
-        last = i + 1
-    }
-    w.Write(s[last:])
+func (el *Template) addChild(child element){
+	el.elements = append(el.elements, child)
 }
 
-func (tmpl *Template) readString(s string) (string, error) {
-    i := tmpl.p
-    newlines := 0
-    for true {
-        //are we at the end of the string?
-        if i+len(s) > len(tmpl.data) {
-            return tmpl.data[tmpl.p:], io.EOF
-        }
-
-        if tmpl.data[i] == '\n' {
-            newlines++
-        }
-
-        if tmpl.data[i] != s[0] {
-            i++
-            continue
-        }
-
-        match := true
-        for j := 1; j < len(s); j++ {
-            if s[j] != tmpl.data[i+j] {
-                match = false
-                break
-            }
-        }
-
-        if match {
-            e := i + len(s)
-            text := tmpl.data[tmpl.p:e]
-            tmpl.p = e
-
-            tmpl.curline += newlines
-            return text, nil
-        } else {
-            i++
-        }
-    }
-
-    //should never be here
-    return "", nil
+func (el *Template) getName() string{
+	return "template"
 }
+
+func (tmpl *Template) Render(writer io.Writer, contextChain []interface{}) {
+	atmpl := tmpl
+	if tmpl.parent != "" {
+		tmpls := []*Template{tmpl}
+		
+		for{
+			if atmpl.parent != "" {
+				filename := path.Join(tmpl.dir, atmpl.parent + tmpl.ext)
+				parentTmpl, err := ParseFile(filename)
+				if err != nil{
+					panic(err)
+				}
+				tmpls = append(tmpls, parentTmpl)
+				atmpl = parentTmpl
+				
+			}else{
+				break
+			}
+		}
+		atmpl = tmpl
+		for i:= 1; i< len(tmpls); i++{
+			for _, block := range atmpl.blocks{
+				_, found := tmpls[i].blocks[block.getName()]
+				if found{
+					tmpls[i].blocks[block.getName()] = block
+				}
+			}
+			
+			atmpl = tmpls[i]
+		}
+		atmpl = tmpls[len(tmpls)-1]
+	}
+	
+	for _, el := range atmpl.elements {
+		if el.Type() != blockType{
+			el.Render(writer, contextChain)
+		}else{
+			atmpl.blocks[el.(*blockElement).getName()].Render(writer, contextChain)
+		}
+	}
+}
+
+func (tmpl *Template) RenderToString(contexts ...interface{}) string{
+	var buf bytes.Buffer
+	tmpl.Render(&buf, contexts)
+	return buf.String()
+}
+
+// goto the next token, and return the passed bytes.
+func (tmpl *Template) nextToken(token string) (text []byte, err error){
+	i := tmpl.pos
+
+	for{
+		if i + len(token) > len(tmpl.data) {
+			return tmpl.data[tmpl.pos:], io.EOF
+		}
+		
+		b := tmpl.data[i]
+
+		if b == '\n' {
+			tmpl.line++
+		}
+
+		if b != token[0] {
+			i++
+			continue
+		}
+		
+		if bytes.HasPrefix(tmpl.data[i+1:], []byte(token[1:])){
+			//match
+			text := tmpl.data[tmpl.pos:i]
+			tmpl.pos = i + len(token)
+			return text, nil
+		}
+		i++
+	}
+	return []byte{}, nil
+}
+
+func (tmpl *Template) parse() error{
+	for{
+		text, err := tmpl.nextToken(tmpl.leftToken)
+
+		if len(text) >0{
+			// add a text element
+			tmpl.addChild(&textElement{textType, text})
+		}
+		
+		if err == io.EOF {
+			return nil
+		}
+
+		// prepare the next token
+		token := tmpl.rightToken
+		if tmpl.pos < len(tmpl.data) && tmpl.data[tmpl.pos] == '{' {
+			// is raw variable element
+			token = tmpl.rightToken + "}"
+		}
+
+		text, err = tmpl.nextToken(token)
+
+		if err == io.EOF{
+			return parseError{tmpl.line, "unmatched open tag"}
+		}
+
+		text = bytes.TrimSpace(text)
+		if len(text) == 0{
+			return parseError{tmpl.line, "empty tag"}
+		}
+
+		// check the kind of element
+		switch text[0]{
+		case '!':
+			// ignore comment
+			break
+		case '#', '^':
+			// section element
+			if tmpl.parent != ""{
+				break
+			}
+			name := string(bytes.TrimSpace(text[1:]))
+
+			//ignore the new line when section start
+			if tmpl.pos < len(tmpl.data) && tmpl.data[tmpl.pos] == '\n'{
+				tmpl.pos += 1
+			}else if tmpl.pos+1 < len(tmpl.data) && tmpl.data[tmpl.pos] == '\r' && tmpl.data[tmpl.pos+1] == '\n'{
+				tmpl.pos += 2
+			}
+
+			section := &sectionElement{sectionType, name, text[0]=='^', []element{}}
+
+			if err = tmpl.pareseContainer(section); err!=nil{
+				return err
+			}
+
+			tmpl.addChild(section)
+
+		case '{':
+			if tmpl.parent != ""{
+				break
+			}
+			// raw tag
+			tmpl.addChild(&variableElement{variableType, string(text[1:]), true})
+
+		case '>':
+			// partial
+			if tmpl.parent != ""{
+				break
+			}
+			name := string(bytes.TrimSpace(text[1:]))
+			partial, err := tmpl.parsePartial(name)
+			if err != nil {
+				return err
+			}
+			tmpl.addChild(partial)
+
+		case '<':
+			// parent template
+			name := string(bytes.TrimSpace(text[1:]))
+			tmpl.parent = name
+
+		case '*':
+			// block element
+			name := string(bytes.TrimSpace(text[1:]))
+
+			block := &blockElement{blockType, name, []element{}}
+
+			if err = tmpl.pareseContainer(block); err!=nil{
+				return err
+			}
+
+			tmpl.addChild(block)
+			tmpl.blocks[name] = block
+
+		case '/':
+			return parseError{tmpl.line, "unmatched close tag"}
+		default:
+			if tmpl.parent != ""{
+				break
+			}
+			tmpl.addChild(&variableElement{variableType, string(text), false})
+		}
+	}
+	return nil
+}
+
+
+func (tmpl *Template) pareseContainer(el container) error{
+	for{
+		text, err := tmpl.nextToken(tmpl.leftToken)
+
+		if err == io.EOF{
+			return parseError{tmpl.line, el.getName() + " has no closing tag"}
+		}
+
+		// add a text element
+		if len(text)>0{
+			el.addChild(&textElement{textType, text})
+		}
+
+		// next token
+		token := tmpl.rightToken
+		if tmpl.pos < len(tmpl.data) && tmpl.data[tmpl.pos] == '{' {
+			// is raw variable element
+			token = tmpl.rightToken + "}"
+		}
+
+		text, err = tmpl.nextToken(token)
+		if err == io.EOF{
+			return parseError{tmpl.line, "unmatched open tag"}
+		}
+
+		text = bytes.TrimSpace(text)
+		if len(text) == 0{
+			return parseError{tmpl.line, "empty tag"}
+		}
+
+		switch text[0]{
+		case '!', '<':
+			// ignore
+			break
+
+		case '#', '^':
+			// section element
+			name := string(bytes.TrimSpace(text[1:]))
+
+			//ignore the new line when section start
+			if tmpl.pos < len(tmpl.data) && tmpl.data[tmpl.pos] == '\n' {
+				tmpl.pos += 1
+			} else if tmpl.pos+1 < len(tmpl.data) && tmpl.data[tmpl.pos] == '\r' && tmpl.data[tmpl.pos+1] == '\n' {
+				tmpl.pos += 2
+			}
+
+			sec := &sectionElement{sectionType, name, text[0]=='^', []element{}}
+
+			if err = tmpl.pareseContainer(sec); err!=nil{
+				return err
+			}
+			
+			el.addChild(sec)
+
+		case '{':
+			// raw tag
+			el.addChild(&variableElement{variableType, string(text[1:]), true})
+
+		case '>':
+			// partial element
+			name := string(bytes.TrimSpace(text[1:]))
+			partial, err := tmpl.parsePartial(name)
+			if err != nil {
+				return err
+			}
+			el.addChild(partial)
+
+		case '*':
+			// block element
+			name := string(bytes.TrimSpace(text[1:]))
+			block := &blockElement{blockType, name, []element{}}
+
+			if err = tmpl.pareseContainer(block); err!=nil{
+				return err
+			}
+
+			el.addChild(block)
+			tmpl.blocks[name] = block
+
+		case '/':
+			// close element
+			name := string(bytes.TrimSpace(text[1:]))
+			if name != el.getName() {
+				return parseError{tmpl.line, "error closing tag: " + name}
+			} else {
+				return nil
+			}
+		default:
+			el.addChild(&variableElement{variableType, string(text), false})
+		}
+	}
+	return nil
+}
+
 
 func (tmpl *Template) parsePartial(name string) (*Template, error) {
-    filenames := []string{
-        path.Join(tmpl.dir, name),
-        path.Join(tmpl.dir, name+".mustache"),
-        path.Join(tmpl.dir, name+".stache"),
-        name,
-        name + ".mustache",
-        name + ".stache",
-    }
-    var filename string
-    for _, name := range filenames {
-        f, err := os.Open(name)
-        if err == nil {
-            filename = name
-            f.Close()
-            break
-        }
-    }
-    if filename == "" {
-        return nil, errors.New(fmt.Sprintf("Could not find partial %q", name))
-    }
+	filename := path.Join(tmpl.dir, name + tmpl.ext)
+	partial, err := ParseFile(filename)
 
-    partial, err := ParseFile(filename)
-
-    if err != nil {
-        return nil, err
-    }
-
-    return partial, nil
+	if err != nil {
+		return nil, err
+	}
+	return partial, nil
 }
 
-func (tmpl *Template) parseSection(section *sectionElement) error {
-    for {
-        text, err := tmpl.readString(tmpl.otag)
-
-        if err == io.EOF {
-            return parseError{section.startline, "Section " + section.name + " has no closing tag"}
-        }
-
-        // put text into an item
-        text = text[0 : len(text)-len(tmpl.otag)]
-        section.elems = append(section.elems, &textElement{[]byte(text)})
-        if tmpl.p < len(tmpl.data) && tmpl.data[tmpl.p] == '{' {
-            text, err = tmpl.readString("}" + tmpl.ctag)
-        } else {
-            text, err = tmpl.readString(tmpl.ctag)
-        }
-
-        if err == io.EOF {
-            //put the remaining text in a block
-            return parseError{tmpl.curline, "unmatched open tag"}
-        }
-
-        //trim the close tag off the text
-        tag := strings.TrimSpace(text[0 : len(text)-len(tmpl.ctag)])
-
-        if len(tag) == 0 {
-            return parseError{tmpl.curline, "empty tag"}
-        }
-        switch tag[0] {
-        case '!':
-            //ignore comment
-            break
-        case '#', '^':
-            name := strings.TrimSpace(tag[1:])
-
-            //ignore the newline when a section starts
-            if len(tmpl.data) > tmpl.p && tmpl.data[tmpl.p] == '\n' {
-                tmpl.p += 1
-            } else if len(tmpl.data) > tmpl.p+1 && tmpl.data[tmpl.p] == '\r' && tmpl.data[tmpl.p+1] == '\n' {
-                tmpl.p += 2
-            }
-
-            se := sectionElement{name, tag[0] == '^', tmpl.curline, []interface{}{}}
-            err := tmpl.parseSection(&se)
-            if err != nil {
-                return err
-            }
-            section.elems = append(section.elems, &se)
-        case '/':
-            name := strings.TrimSpace(tag[1:])
-            if name != section.name {
-                return parseError{tmpl.curline, "interleaved closing tag: " + name}
-            } else {
-                return nil
-            }
-        case '>':
-            name := strings.TrimSpace(tag[1:])
-            partial, err := tmpl.parsePartial(name)
-            if err != nil {
-                return err
-            }
-            section.elems = append(section.elems, partial)
-        case '=':
-            if tag[len(tag)-1] != '=' {
-                return parseError{tmpl.curline, "Invalid meta tag"}
-            }
-            tag = strings.TrimSpace(tag[1 : len(tag)-1])
-            newtags := strings.SplitN(tag, " ", 2)
-            if len(newtags) == 2 {
-                tmpl.otag = newtags[0]
-                tmpl.ctag = newtags[1]
-            }
-        case '{':
-            if tag[len(tag)-1] == '}' {
-                //use a raw tag
-                section.elems = append(section.elems, &varElement{tag[1 : len(tag)-1], true})
-            }
-        default:
-            section.elems = append(section.elems, &varElement{tag, false})
-        }
-    }
-
-    return nil
-}
-
-func (tmpl *Template) parse() error {
-    for {
-        text, err := tmpl.readString(tmpl.otag)
-        if err == io.EOF {
-            //put the remaining text in a block
-            tmpl.elems = append(tmpl.elems, &textElement{[]byte(text)})
-            return nil
-        }
-
-        // put text into an item
-        text = text[0 : len(text)-len(tmpl.otag)]
-        tmpl.elems = append(tmpl.elems, &textElement{[]byte(text)})
-
-        if tmpl.p < len(tmpl.data) && tmpl.data[tmpl.p] == '{' {
-            text, err = tmpl.readString("}" + tmpl.ctag)
-        } else {
-            text, err = tmpl.readString(tmpl.ctag)
-        }
-
-        if err == io.EOF {
-            //put the remaining text in a block
-            return parseError{tmpl.curline, "unmatched open tag"}
-        }
-
-        //trim the close tag off the text
-        tag := strings.TrimSpace(text[0 : len(text)-len(tmpl.ctag)])
-        if len(tag) == 0 {
-            return parseError{tmpl.curline, "empty tag"}
-        }
-        switch tag[0] {
-        case '!':
-            //ignore comment
-            break
-        case '#', '^':
-            name := strings.TrimSpace(tag[1:])
-
-            if len(tmpl.data) > tmpl.p && tmpl.data[tmpl.p] == '\n' {
-                tmpl.p += 1
-            } else if len(tmpl.data) > tmpl.p+1 && tmpl.data[tmpl.p] == '\r' && tmpl.data[tmpl.p+1] == '\n' {
-                tmpl.p += 2
-            }
-
-            se := sectionElement{name, tag[0] == '^', tmpl.curline, []interface{}{}}
-            err := tmpl.parseSection(&se)
-            if err != nil {
-                return err
-            }
-            tmpl.elems = append(tmpl.elems, &se)
-        case '/':
-            return parseError{tmpl.curline, "unmatched close tag"}
-        case '>':
-            name := strings.TrimSpace(tag[1:])
-            partial, err := tmpl.parsePartial(name)
-            if err != nil {
-                return err
-            }
-            tmpl.elems = append(tmpl.elems, partial)
-        case '=':
-            if tag[len(tag)-1] != '=' {
-                return parseError{tmpl.curline, "Invalid meta tag"}
-            }
-            tag = strings.TrimSpace(tag[1 : len(tag)-1])
-            newtags := strings.SplitN(tag, " ", 2)
-            if len(newtags) == 2 {
-                tmpl.otag = newtags[0]
-                tmpl.ctag = newtags[1]
-            }
-        case '{':
-            //use a raw tag
-            if tag[len(tag)-1] == '}' {
-                tmpl.elems = append(tmpl.elems, &varElement{tag[1 : len(tag)-1], true})
-            }
-        default:
-            tmpl.elems = append(tmpl.elems, &varElement{tag, false})
-        }
-    }
-
-    return nil
-}
-
-// See if name is a method of the value at some level of indirection.
-// The return values are the result of the call (which may be nil if
-// there's trouble) and whether a method of the right name exists with
-// any signature.
-func callMethod(data reflect.Value, name string) (result reflect.Value, found bool) {
-    found = false
-    // Method set depends on pointerness, and the value may be arbitrarily
-    // indirect.  Simplest approach is to walk down the pointer chain and
-    // see if we can find the method at each step.
-    // Most steps will see NumMethod() == 0.
-    for {
-        typ := data.Type()
-        if nMethod := data.Type().NumMethod(); nMethod > 0 {
-            for i := 0; i < nMethod; i++ {
-                method := typ.Method(i)
-                if method.Name == name {
-
-                    found = true // we found the name regardless
-                    // does receiver type match? (pointerness might be off)
-                    if typ == method.Type.In(0) {
-                        return call(data, method), found
-                    }
-                }
-            }
-        }
-        if nd := data; nd.Kind() == reflect.Ptr {
-            data = nd.Elem()
-        } else {
-            break
-        }
-    }
-    return
-}
-
-// Invoke the method. If its signature is wrong, return nil.
-func call(v reflect.Value, method reflect.Method) reflect.Value {
-    funcType := method.Type
-    // Method must take no arguments, meaning as a func it has one argument (the receiver)
-    if funcType.NumIn() != 1 {
-        return reflect.Value{}
-    }
-    // Method must return a single value.
-    if funcType.NumOut() == 0 {
-        return reflect.Value{}
-    }
-    // Result will be the zeroth element of the returned slice.
-    return method.Func.Call([]reflect.Value{v})[0]
-}
-
-// Evaluate interfaces and pointers looking for a value that can look up the name, via a
-// struct field, method, or map key, and return the result of the lookup.
-func lookup(contextChain []interface{}, name string) reflect.Value {
-    defer func() {
-        if r := recover(); r != nil {
-            fmt.Printf("Panic while looking up %q: %s\n", name, r)
-        }
-    }()
-
-Outer:
-    for _, ctx := range contextChain { //i := len(contextChain) - 1; i >= 0; i-- {
-        v := ctx.(reflect.Value)
-        for v.IsValid() {
-            typ := v.Type()
-            if n := v.Type().NumMethod(); n > 0 {
-                for i := 0; i < n; i++ {
-                    m := typ.Method(i)
-                    mtyp := m.Type
-                    if m.Name == name && mtyp.NumIn() == 1 {
-                        return v.Method(i).Call(nil)[0]
-                    }
-                }
-            }
-            switch av := v; av.Kind() {
-            case reflect.Ptr:
-                v = av.Elem()
-            case reflect.Interface:
-                v = av.Elem()
-            case reflect.Struct:
-                ret := av.FieldByName(name)
-                if ret.IsValid() {
-                    return ret
-                } else {
-                    continue Outer
-                }
-            case reflect.Map:
-                ret := av.MapIndex(reflect.ValueOf(name))
-                if ret.IsValid() {
-                    return ret
-                } else {
-                    continue Outer
-                }
-            default:
-                continue Outer
-            }
-        }
-    }
-    return reflect.Value{}
-}
-
-func isNil(v reflect.Value) bool {
-    if !v.IsValid() || v.Interface() == nil {
-        return true
-    }
-
-    valueInd := indirect(v)
-    if !valueInd.IsValid() {
-        return true
-    }
-    switch val := valueInd; val.Kind() {
-    case reflect.Bool:
-        return !val.Bool()
-    }
-
-    return false
-}
-
-func indirect(v reflect.Value) reflect.Value {
-loop:
-    for v.IsValid() {
-        switch av := v; av.Kind() {
-        case reflect.Ptr:
-            v = av.Elem()
-        case reflect.Interface:
-            v = av.Elem()
-        default:
-            break loop
-        }
-    }
-    return v
-}
-
-func renderSection(section *sectionElement, contextChain []interface{}, buf io.Writer) {
-    value := lookup(contextChain, section.name)
-    var context = contextChain[len(contextChain)-1].(reflect.Value)
-    var contexts = []interface{}{}
-    // if the value is nil, check if it's an inverted section
-    isNil := isNil(value)
-    if isNil && !section.inverted || !isNil && section.inverted {
-        return
-    } else {
-        valueInd := indirect(value)
-        switch val := valueInd; val.Kind() {
-        case reflect.Slice:
-            for i := 0; i < val.Len(); i++ {
-                contexts = append(contexts, val.Index(i))
-            }
-        case reflect.Array:
-            for i := 0; i < val.Len(); i++ {
-                contexts = append(contexts, val.Index(i))
-            }
-        case reflect.Map, reflect.Struct:
-            contexts = append(contexts, value)
-        default:
-            contexts = append(contexts, context)
-        }
-    }
-
-    chain2 := make([]interface{}, len(contextChain)+1)
-    copy(chain2[1:], contextChain)
-    //by default we execute the section
-    for _, ctx := range contexts {
-        chain2[0] = ctx
-        for _, elem := range section.elems {
-            renderElement(elem, chain2, buf)
-        }
-    }
-}
-
-func renderElement(element interface{}, contextChain []interface{}, buf io.Writer) {
-    switch elem := element.(type) {
-    case *textElement:
-        buf.Write(elem.text)
-    case *varElement:
-        defer func() {
-            if r := recover(); r != nil {
-                fmt.Printf("Panic while looking up %q: %s\n", elem.name, r)
-            }
-        }()
-        val := lookup(contextChain, elem.name)
-
-        if val.IsValid() {
-            if elem.raw {
-                fmt.Fprint(buf, val.Interface())
-            } else {
-                s := fmt.Sprint(val.Interface())
-                htmlEscape(buf, []byte(s))
-            }
-        }
-    case *sectionElement:
-        renderSection(elem, contextChain, buf)
-    case *Template:
-        elem.renderTemplate(contextChain, buf)
-    }
-}
-
-func (tmpl *Template) renderTemplate(contextChain []interface{}, buf io.Writer) {
-    for _, elem := range tmpl.elems {
-        renderElement(elem, contextChain, buf)
-    }
-}
-
-func (tmpl *Template) Render(context ...interface{}) string {
-    var buf bytes.Buffer
-    var contextChain []interface{}
-    for _, c := range context {
-        val := reflect.ValueOf(c)
-        contextChain = append(contextChain, val)
-    }
-    tmpl.renderTemplate(contextChain, &buf)
-    return buf.String()
-}
-
-func (tmpl *Template) RenderInLayout(layout *Template, context ...interface{}) string {
-    content := tmpl.Render(context...)
-    allContext := make([]interface{}, len(context)+1)
-    copy(allContext[1:], context)
-    allContext[0] = map[string]string{"content": content}
-    return layout.Render(allContext...)
-}
 
 func ParseString(data string) (*Template, error) {
-    cwd := os.Getenv("CWD")
-    tmpl := Template{data, "{{", "}}", 0, 1, cwd, []interface{}{}}
-    err := tmpl.parse()
+	cwd := os.Getenv("CWD")
+	tmpl := Template{templateType, []byte(data), "{{", "}}", 0, 1, cwd, []element{}, map[string]*blockElement{}, "", ""}
+	err := tmpl.parse()
 
-    if err != nil {
-        return nil, err
-    }
+	if err != nil {
+		return nil, err
+	}
 
-    return &tmpl, err
+	return &tmpl, err
 }
 
+
 func ParseFile(filename string) (*Template, error) {
-    data, err := ioutil.ReadFile(filename)
-    if err != nil {
-        return nil, err
-    }
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
 
-    dirname, _ := path.Split(filename)
+	dirname, fname := path.Split(filename)
+	ext := path.Ext(fname)
 
-    tmpl := Template{string(data), "{{", "}}", 0, 1, dirname, []interface{}{}}
-    err = tmpl.parse()
+	tmpl := Template{templateType, data, "{{", "}}", 0, 1, dirname, []element{}, map[string]*blockElement{}, ext, ""}
 
-    if err != nil {
-        return nil, err
-    }
+	err = tmpl.parse()
+	if err != nil {
+		return nil, err
+	}
 
-    return &tmpl, nil
+	return &tmpl, nil
 }
 
 func Render(data string, context ...interface{}) string {
-    tmpl, err := ParseString(data)
-    if err != nil {
-        return err.Error()
-    }
-    return tmpl.Render(context...)
-}
-
-func RenderInLayout(data string, layoutData string, context ...interface{}) string {
-    layoutTmpl, err := ParseString(layoutData)
-    if err != nil {
-        return err.Error()
-    }
-    tmpl, err := ParseString(data)
-    if err != nil {
-        return err.Error()
-    }
-    return tmpl.RenderInLayout(layoutTmpl, context...)
+	tmpl, err := ParseString(data)
+	if err != nil {
+		return err.Error()
+	}
+	return tmpl.RenderToString(context...)
 }
 
 func RenderFile(filename string, context ...interface{}) string {
-    tmpl, err := ParseFile(filename)
-    if err != nil {
-        return err.Error()
-    }
-    return tmpl.Render(context...)
+	tmpl, err := ParseFile(filename)
+	if err != nil {
+		return err.Error()
+	}
+	return tmpl.RenderToString(context...)
 }
 
-func RenderFileInLayout(filename string, layoutFile string, context ...interface{}) string {
-    layoutTmpl, err := ParseFile(layoutFile)
-    if err != nil {
-        return err.Error()
-    }
 
-    tmpl, err := ParseFile(filename)
-    if err != nil {
-        return err.Error()
-    }
-    return tmpl.RenderInLayout(layoutTmpl, context...)
+//=============================================
+// helper fuction
+//=============================================
+
+
+type parseError struct {
+	line    int
+	message string
+}
+
+func (p parseError) Error() string {
+	return fmt.Sprintf("line %d: %s", p.line, p.message)
+}
+
+
+func lookupAttr(name string, contextChain []interface{}) (reflect.Value) {
+	Outer:
+	for _, ctx := range contextChain{
+
+		v := reflect.ValueOf(ctx)
+
+		for v.IsValid(){
+			// check func
+			t := v.Type()
+			if n := v.Type().NumMethod(); n > 0 {
+				for i := 0; i < n; i++ {
+					m := t.Method(i)
+					if m.Name == name && m.Type.NumIn() == 1 {
+						return v.Method(i).Call(nil)[0]
+					}
+				}
+			}
+
+			switch av:=v; av.Kind(){
+
+			case reflect.Ptr, reflect.Interface:
+				v = av.Elem()
+
+			case reflect.Struct:
+				ret := av.FieldByName(name)
+				if ret.IsValid() {
+					if ret.Kind() == reflect.Interface || ret.Kind() == reflect.Ptr{
+						ret = ret.Elem()
+					}
+					return ret
+				} else {
+					continue Outer
+				}
+
+			case reflect.Map:
+				ret := av.MapIndex(reflect.ValueOf(name))
+
+				if ret.IsValid() {
+					if ret.Kind() == reflect.Interface || ret.Kind() == reflect.Ptr{
+						ret = ret.Elem()
+					}
+					return ret
+				} else {
+					continue Outer
+				}
+
+			default:
+				continue Outer
+			}
+		}
+	}
+	return reflect.Value{}
+}
+
+func lookup(name string, contextChain []interface{}) reflect.Value {
+	var v = reflect.Value{}
+
+	var ctxs = make([]interface{}, len(contextChain)+1)
+	copy(ctxs[1:], contextChain)
+
+
+	for idx, attr := range strings.Split(name, "."){
+
+		if idx>0{
+			ctxs[0] = v.Interface()
+			v = lookupAttr(attr, ctxs)
+		}else{
+			v = lookupAttr(attr, contextChain)
+		}
+
+		if !v.IsValid(){
+			break
+		}
+	}
+	return v
+}
+
+
+func isTrue(val reflect.Value) bool {
+	if !val.IsValid() {
+		return false
+	}
+	switch val.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return val.Len() > 0
+	case reflect.Bool:
+		return val.Bool()
+	case reflect.Complex64, reflect.Complex128:
+		return val.Complex() != 0
+	case reflect.Chan, reflect.Func, reflect.Ptr, reflect.Interface:
+		return !val.IsNil()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return val.Int() != 0
+	case reflect.Float32, reflect.Float64:
+		return val.Float() != 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return val.Uint() != 0
+	case reflect.Struct:
+		return true // Struct values are always true.
+	}
+	return false
 }

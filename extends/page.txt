@@ -1,0 +1,9 @@
+{{<layout}}
+
+extend "layout" template, and any words out or block element will be ignored.
+
+{{*body}}{{Body}}{{/body}}
+
+{{*NotRender}}
+because the block is not declared in parent.
+{{/NotRender}}

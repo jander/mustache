@@ -16,7 +16,7 @@ For more information about mustache, check out the [mustache project page](http:
 Also check out some [example mustache files](http://github.com/defunkt/mustache/tree/master/examples/)
 
 ## Installation
-To install mustache.go, simply run `go get github.com/jander/mustache`. To use it in a program, use `import "github.com/jander/mustache"`
+To install mustache.go, simply run `go get github.com/hoisie/mustache`. To use it in a program, use `import "github.com/hoisie/mustache"`
 
 ## Usage
 There are four main methods in this package:
@@ -75,7 +75,7 @@ child.html
 
     {{<layout}}
     {{*title}}child title{{/title}}
-    {{*body}}<h1> Hello World! {{/body}}
+    {{*body}}<h1> Hello World! </h1>{{/body}}
 
 A call to `RenderFile("child.html", nil)` will produce:
 
@@ -119,8 +119,7 @@ It'll be blank. You either have to use `&Person{"John", "Smith"}`, or call `Name
 * Sections (boolean, enumerable, and inverted)
 * Partials
 
-## New features
+## New Points
 
 * Nested visit
 * Template Inheritance
-

@@ -1,0 +1,1 @@
+{{*header}}Header {{/header}}{{*body}}Layout Body{{/body}}{{*footer}} Footer{{/footer}}

@@ -1,7 +1,7 @@
 package mustache
 
 import (
-    "io"
+	"io"
 	"io/ioutil"
 	"fmt"
 	"html"

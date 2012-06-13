@@ -1,7 +1,7 @@
 package mustache
 
 import (
-    "os"
+	"os"
 	"path"
 	"strings"
 	"testing"

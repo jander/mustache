@@ -2,6 +2,13 @@
 
 mustache.go is an implementation of the mustache template language in Go. It is better suited for website templates than Go's native pkg/template. mustache.go is fast -- it parses templates efficiently and stores them in a tree-like structure which allows for fast execution. 
 
+this fork make two new points:
+
+* Nested visit:  {{A.B.C}}, {{#A.B}}{{C}}{{/A.B}} can be use.
+
+* Template Inheritance: a template can inherit a parent template, see below.
+
+
 ## Documentation
 
 For more information about mustache, check out the [mustache project page](http://github.com/defunkt/mustache) or the [mustache manual](http://mustache.github.com/mustache.5.html).
@@ -9,7 +16,7 @@ For more information about mustache, check out the [mustache project page](http:
 Also check out some [example mustache files](http://github.com/defunkt/mustache/tree/master/examples/)
 
 ## Installation
-To install mustache.go, simply run `go get github.com/hoisie/mustache`. To use it in a program, use `import "github.com/hoisie/mustache"`
+To install mustache.go, simply run `go get github.com/jander/mustache`. To use it in a program, use `import "github.com/jander/mustache"`
 
 ## Usage
 There are four main methods in this package:
@@ -44,37 +51,41 @@ For more example usage, please see `mustache_test.go`
 
 mustache.go follows the official mustache HTML escaping rules. That is, if you enclose a variable with two curly brackets, `{{var}}`, the contents are HTML-escaped. For instance, strings like `5 > 2` are converted to `5 &gt; 2`. To use raw characters, use three curly brackets `{{{var}}}`.
 
-## Layouts
 
-It is a common pattern to include a template file as a "wrapper" for other templates. The wrapper may include a header and a footer, for instance. Mustache.go supports this pattern with the following two methods:
+## Template Inheritance
 
-    func RenderInLayout(data string, layout string, context ...interface{}) string
-    
-    func RenderFileInLayout(filename string, layoutFile string, context ...interface{}) string
-    
-The layout file must have a variable called `{{content}}`. For example, given the following files:
+Get inspiration from jinja2(http://jinja.pocoo.org/), a template can inherit a parent template. Template inheritance allows you to build a base “skeleton” template that contains all the common elements of your site and defines blocks that child templates can override.
 
-layout.html.mustache:
+use {{<ParentTemplate}} to declare a template inherit a parent template.
+
+use {{*BlockName}} to declare a block.
+
+layout.html:
 
     <html>
-    <head><title>Hi</title></head>
+    <head><title>{{*title}}Hi{{/title}}</title></head>
     <body>
-    {{{content}}}
+    {{*body}}
+    this content will be replace with child definition.
+    {{/body}}
     </body>
     </html>
 
-template.html.mustache:
+child.html
 
-    <h1> Hello World! </h1>
+    {{<layout}}
+    {{*title}}child title{{/title}}
+    {{*body}}<h1> Hello World! {{/body}}
 
-A call to `RenderFileInLayout("template.html.mustache", "layout.html.mustache", nil)` will produce:
+A call to `RenderFile("child.html", nil)` will produce:
 
     <html>
-    <head><title>Hi</title></head>
+    <head><title>child title</title></head>
     <body>
     <h1> Hello World! </h1>
     </body>
     </html>
+
 
 ## A note about method receivers
 
@@ -105,8 +116,11 @@ It'll be blank. You either have to use `&Person{"John", "Smith"}`, or call `Name
 
 * Variables
 * Comments
-* Change delimiter
 * Sections (boolean, enumerable, and inverted)
 * Partials
 
+## New Points
+
+* Nested visit
+* Template Inheritance
 

@@ -244,9 +244,8 @@ func TestNested(t *testing.T) {
 	}
 }
 
-
 func TestFileInherit(t *testing.T) {
-	filename := path.Join(path.Join(os.Getenv("PWD"), "extends"), "page.txt")
+	filename := path.Join(path.Join(os.Getenv("PWD"), "inherit_tests"), "page.txt")
 	expected := "Header Page Body Footer"
 	context := map[string]string{"Body": "Page Body"}
 

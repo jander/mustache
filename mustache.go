@@ -203,11 +203,11 @@ type Template struct {
 	rightToken string
 	pos int
 	line int
-	dir string
-	elements []element
-	blocks map[string]*blockElement
-	ext string
-	parent string
+	dir string                         // template file dir
+	elements []element                 // children elements
+	blocks map[string]*blockElement    // blcok map
+	ext string                         // file extension
+	parent string                      // parent template name
 }
 
 func (el *Template) String() string{
